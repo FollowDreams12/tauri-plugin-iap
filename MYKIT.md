@@ -95,18 +95,37 @@ mint 前后的长度与是否为空。
 **商店没返回商品** / **返回了但没匹配上** / **匹配上了但价格是空串**。
 没有它们，这三种在调用方看起来一模一样。
 
+## 上游 rc.9 / rc.10 / main 到底改了什么（2026-10-24 逐文件核对）
+
+**结论：rc.8 之后没有任何 Windows 逻辑修复。没有升级的必要，升级反而引入新风险。**
+
+| 对比 | `src/windows.rs` | 其它文件 |
+|---|---|---|
+| rc.8 → rc.9 | 只有 `#[allow(unknown_lints, clippy::unused_async_trait_impl)]` 属性调整，**逻辑零改动** | lint / 注释 |
+| rc.9 → rc.10 | **零改动**（`diff` 无任何输出） | 删掉废弃的 `initialize` 命令（`commands.rs` / `lib.rs` / `models.rs`）；`tauri = "2.11.4"` → `"2"`；`base64 0.22` → `0.23`；`rust-version 1.90` → `1.93` |
+| rc.10 → `main` | 全部 `.get()` → `.join()`，**这只是 windows crate 0.62 的 API 改名，语义仍是同步阻塞**，我们实测的挂起 bug 原样存在 | 依赖升级、CI |
+
+也就是说，「积分包不进 `AddOnLicenses`」和「mint 可能永久挂起」两条，在 rc.10 和最新 `main` 上都**没修**。
+
+⚠️ **不要升 rc.10**：它把 `tauri = "2.11.4"` 放宽成 `tauri = "2"`，更容易解析到 tauri 2.12 →
+`windows 0.62`，而它自己的 `windows` 依赖仍写 `"0.61"`，直接踩 `HWND` 类型不匹配。
+rc.8 的 pin 反而是对的。
+
 ## 与上游同步
 
-上游 `0.10.0-rc.9` / `0.10.0-rc.10` / `main`（截至 2026-10-04）**都没修上面两条**，
-所以升级上游不会让本 fork 失效 —— 反过来说，**直接升官方版本会把这两个 bug 带回来**。
+基线固定在上游 commit `275cfceb`（= crates.io rc.8，实测通过的那一版）。
 
-跟进上游的做法（保持 `mykit` 只有两个提交，rebase 即可）：
+跟进上游的做法（`mykit` 只有 3 个提交，rebase 即可）：
 
 ```bash
 git fetch upstream
 git rebase --onto upstream/main 275cfceb mykit
-# 有冲突只会落在 src/windows.rs 的两处改动上，手工合并后重新跑回归自检
+# 冲突只会落在 src/windows.rs 的两处改动 + Cargo.toml 的 feature 列表上
 ```
+
+**如果要跟 `main`（windows 0.62），额外要做**：把剩余的 `.get()` 全换成 `.join()`
+（`GetAppLicenseAsync` ×2、`GetAssociatedStoreProductsAsync` ×1、`RequestPurchaseAsync` ×1、
+`ReportConsumableFulfillmentAsync` ×1；`mint_store_id_key` 里那两处已经被我们的轮询替代，无需改）。
 
 回归自检：
 
