@@ -34,6 +34,18 @@ tauri-plugin-iap = { git = "https://github.com/<OWNER>/tauri-plugin-iap", tag = 
 > 首次构建需要能访问 GitHub（cargo 会 clone 到 `~/.cargo/git/`）。之后靠 `Cargo.lock` 固定 rev，
 > 同一台机器不再需要网络。
 
+## 版本配套（一个坑）
+
+基线锁定 `windows = "0.61"`。tauri 从 2.12 起会拉 `windows 0.62`，两个版本的 `HWND` 是不同类型，
+`IInitializeWithWindow::Initialize` 会报类型不匹配。所以：
+
+- **App 侧 tauri 保持在 2.11.x（解析到 `windows 0.61.3`）时完全正常**；
+- 把 tauri 升到解析出 `windows 0.62` 的版本之前，先升级本 fork（上游 main 已经用
+  `.get()` → `.join()` 跟进 0.62，可以照抄）。
+
+不要在不同 App 里一边升 tauri 一边留着旧 fork 不升级，那样报错信息（`expected HWND, found HWND`）
+会非常难懂。
+
 ## 改了什么
 
 ### 1. `restore_purchases` 漏掉开发者管理的消耗品（行为修复）
@@ -62,7 +74,18 @@ Tauri 的 async command 跑在 tokio 工作线程上，**实测出现过永久�
 修法：改成 `Status()` 轮询 + 20s 截止 + `Cancel()`，超时返回可识别的错误码
 `storeIdentityTimeout` / `storeIdentityCanceled` / `storeIdentityFailed`，交给前端降级，而不是卡死。
 
-### 3. `IAP_DIAG` 诊断日志（无行为变更）
+### 3. crate 不自包含：`Win32_UI_Shell` feature 没开（构建修复）
+
+`src/windows.rs` 用了 `Win32::UI::Shell::IInitializeWithWindow`（给 Store 购买弹窗指定父窗口），
+但上游 `Cargo.toml` 的 `windows` 依赖只开了 `Foundation` / `Foundation_Collections` /
+`Services_Store` / `System`，**没开 `Win32_UI_Shell`**。
+
+结果：这个 crate 只能在使用方**恰好也**依赖 `windows` 并开启 `Win32_UI_Shell` 时编译通过，
+否则报 `cannot find Win32 in windows`。属于上游的隐性耦合。
+
+修法：在 fork 的 manifest 里补上 `"Win32_UI_Shell"`。只加 feature，不改行为。
+
+### 4. `IAP_DIAG` 诊断日志（无行为变更）
 
 `query_associated_products` / `get_products` / `mint_store_id_key` / `restore_purchases`
 打印请求了哪些 id、命中了哪些、每个商品的价格原值（`""` 与 `<err 0x..>` 可区分）、

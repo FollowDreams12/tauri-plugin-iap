@@ -32,6 +32,12 @@ windows = { version = "0.61", features = [
     "Foundation_Collections",
     "Services_Store",
     "System",
+    # `windows.rs` imports Win32::UI::Shell::IInitializeWithWindow (needed to
+    # parent the Store purchase dialog), but upstream never enables it here and
+    # instead relies on the *consumer* pulling in that feature. So a crate that
+    # depends on this plugin without also depending on `windows` with
+    # `Win32_UI_Shell` fails with "cannot find Win32 in windows".
+    "Win32_UI_Shell",
 ] }
 windows-collections = "0.2"
 
