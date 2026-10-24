@@ -233,18 +233,64 @@ impl<R: Runtime> Iap<R> {
         publisher_user_id: &str,
     ) -> crate::Result<String> {
         let context = self.get_store_context()?;
+        // 「key 有没有 mint 出来」曾是最难查的一环：mint 失败和 mint 出空串
+        // 在调用方看起来一样，都会变成服务端的 401/空结果。这里两头都记。
+        log::info!(
+            "IAP_DIAG mint key: type={product_type}, ticket_len={}, user_id_len={}",
+            service_ticket.len(),
+            publisher_user_id.len()
+        );
         let ticket = HSTRING::from(service_ticket);
         let user_id = HSTRING::from(publisher_user_id);
-        let key = if product_type == "subs" {
-            context
-                .GetCustomerPurchaseIdAsync(&ticket, &user_id)
-                .and_then(|op| op.get())?
+        let op = if product_type == "subs" {
+            context.GetCustomerPurchaseIdAsync(&ticket, &user_id)?
         } else {
-            context
-                .GetCustomerCollectionsIdAsync(&ticket, &user_id)
-                .and_then(|op| op.get())?
+            context.GetCustomerCollectionsIdAsync(&ticket, &user_id)?
         };
-        Ok(key.to_string())
+        // ⚠️ 不要用 `op.get()`：它是同步阻塞等待，而 Store 的完成回调依赖有消息泵的
+        // 线程。Tauri 的 async command 跑在 tokio 工作线程上，**实测出现过永久不返回**
+        // （前端 invoke 一直 pending：恢复购买转圈、订阅同步根本发不出去）。
+        // 改成带截止时间的轮询 + Cancel，保证一定有返回值；超时交前端降级处理。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            // `AsyncStatus` 在 windows-future 里是 `struct AsyncStatus(pub i32)`：
+            // 0=Started, 1=Completed, 2=Canceled, 3=Error。按数值判断，就不必为一个
+            // 类型引入新依赖（windows 0.61 并未 re-export 它）。
+            let status = op.Status()?.0;
+            if status == 1 {
+                let key = op.GetResults()?.to_string();
+                log::info!(
+                    "IAP_DIAG mint key result: type={product_type}, len={}, empty={}",
+                    key.len(),
+                    key.trim().is_empty()
+                );
+                return Ok(key);
+            }
+            if status == 2 {
+                log::warn!("IAP_DIAG mint key canceled: type={product_type}");
+                return Err(reject(
+                    "storeIdentityCanceled",
+                    "Store identity request was canceled",
+                ));
+            }
+            if status == 3 {
+                let code = op.ErrorCode().map(|e| e.0 as u32).unwrap_or(0);
+                log::warn!("IAP_DIAG mint key failed: type={product_type}, hresult=0x{code:08X}");
+                return Err(reject(
+                    "storeIdentityFailed",
+                    format!("Store identity request failed: 0x{code:08X}"),
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = op.Cancel();
+                log::warn!("IAP_DIAG mint key timed out: type={product_type}");
+                return Err(reject(
+                    "storeIdentityTimeout",
+                    "Store identity request timed out",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     /// Developer-defined product id exposed by Microsoft Store as `InAppOfferToken`.
@@ -318,6 +364,36 @@ impl<R: Runtime> Iap<R> {
         for kv in products_map {
             products.push(kv.Value()?);
         }
+
+        // Diagnostics only (no behavior change). A WinRT string property that
+        // "succeeds" can still be empty, and an empty price is indistinguishable
+        // from "no price" further up, so print every price source separately and
+        // distinguish "" from a failed call.
+        let field = |value: windows::core::Result<HSTRING>| match value {
+            Ok(value) => format!("{:?}", value.to_string()),
+            Err(error) => format!("<err 0x{:08X}>", error.code().0 as u32),
+        };
+        for product in &products {
+            let offer_token = field(product.InAppOfferToken());
+            let product_kind = field(product.ProductKind());
+            let price = match product.Price() {
+                Ok(price) => format!(
+                    "price={} base={} recurrence={} currency={}",
+                    field(price.FormattedPrice()),
+                    field(price.FormattedBasePrice()),
+                    field(price.FormattedRecurrencePrice()),
+                    field(price.CurrencyCode()),
+                ),
+                Err(error) => format!("<err 0x{:08X}>", error.code().0 as u32),
+            };
+            log::info!(
+                "IAP_DIAG store product: type={product_type}, offer_token={offer_token}, kind={product_kind}, {price}"
+            );
+        }
+        log::info!(
+            "IAP_DIAG store query: type={product_type}, count={}",
+            products.len()
+        );
         Ok(products)
     }
 
@@ -329,12 +405,18 @@ impl<R: Runtime> Iap<R> {
     ) -> crate::Result<GetProductsResponse> {
         let store_products = self.query_associated_products(&product_type)?;
         let mut products = Vec::new();
+        log::info!(
+            "IAP_DIAG get_products: type={product_type}, requested={product_ids:?}"
+        );
 
         for requested_id in product_ids {
             let Some(store_product) = store_products
                 .iter()
                 .find(|sp| Self::app_product_id(sp).is_ok_and(|id| id == requested_id))
             else {
+                log::warn!(
+                    "IAP_DIAG get_products miss: type={product_type}, id={requested_id} not in associated list"
+                );
                 continue;
             };
             products.push(Self::convert_store_product_to_product(
@@ -342,6 +424,18 @@ impl<R: Runtime> Iap<R> {
                 &product_type,
             )?);
         }
+
+        log::info!(
+            "IAP_DIAG get_products matched: type={product_type}, returned={:?}, prices={:?}",
+            products
+                .iter()
+                .map(|product| product.product_id.as_str())
+                .collect::<Vec<_>>(),
+            products
+                .iter()
+                .map(|product| product.formatted_price.as_deref().unwrap_or("<none>"))
+                .collect::<Vec<_>>()
+        );
 
         Ok(GetProductsResponse { products })
     }
@@ -629,6 +723,94 @@ impl<R: Runtime> Iap<R> {
                 purchases.push(purchase);
             }
         }
+
+        // Developer-managed consumables (credit packs) are **collection items,
+        // not licenses**: `AddOnLicenses` never lists them. Verified 2026-10-24
+        // against a real Store-installed build of this app, same account:
+        //   AddOnLicenses.Count = 1            -> only the subscription
+        //   GetUserCollectionAsync(["UnmanagedConsumable"])
+        //                                      -> the purchased credit pack
+        // Without this, a purchased-but-not-yet-fulfilled pack is invisible to
+        // restore, so it can never be reported as fulfilled and the Store keeps
+        // it locked as "already owned" (the buyer can't purchase it again).
+        if request.product_type == "inapp" {
+            let collection_kinds: IIterable<HSTRING> = vec![
+                HSTRING::from("UnmanagedConsumable"),
+                HSTRING::from("Consumable"),
+            ]
+            .into();
+            match context
+                .GetUserCollectionAsync(&collection_kinds)
+                .and_then(|async_op| async_op.get())
+            {
+                Ok(collection) => match collection.Products() {
+                    Ok(collection_products) => {
+                        let mut added = 0usize;
+                        for kv in collection_products {
+                            let Ok(product) = kv.Value() else { continue };
+                            let Ok(offer_token) = product.InAppOfferToken() else {
+                                continue;
+                            };
+                            let offer_token = offer_token.to_string();
+                            if purchases
+                                .iter()
+                                .any(|existing| existing.product_id == offer_token)
+                            {
+                                continue;
+                            }
+                            let Ok(store_id) = product.StoreId() else {
+                                continue;
+                            };
+                            let purchase_time = FileTime::now().to_unix_time_millis();
+                            let Ok(purchase_token) =
+                                WindowsPurchaseTokenV1::new(
+                                    store_id.to_string(),
+                                    purchase_time,
+                                )
+                                .and_then(|value| value.encode())
+                            else {
+                                continue;
+                            };
+                            purchases.push(Purchase {
+                                order_id: None,
+                                package_name: product
+                                    .Title()
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_default(),
+                                product_id: offer_token,
+                                purchase_time,
+                                purchase_token,
+                                purchase_state: PurchaseStateValue::Purchased,
+                                is_auto_renewing: false,
+                                // Consumables stay unfulfilled until the backend
+                                // confirms delivery; the backend reports it.
+                                is_acknowledged: false,
+                                original_json: "{}".to_string(),
+                                signature: String::new(),
+                                original_id: None,
+                                jws_representation: jws_representation.clone(),
+                            });
+                            added += 1;
+                        }
+                        log::info!("IAP_DIAG restore: collection consumables added={added}");
+                    }
+                    Err(error) => log::warn!(
+                        "IAP_DIAG restore: collection products unreadable, hresult=0x{:08X}",
+                        error.code().0 as u32
+                    ),
+                },
+                Err(error) => log::warn!(
+                    "IAP_DIAG restore: user collection query failed, hresult=0x{:08X}",
+                    error.code().0 as u32
+                ),
+            }
+        }
+
+        log::info!(
+            "IAP_DIAG restore: type={}, total purchases={}",
+            request.product_type,
+            purchases.len()
+        );
 
         Ok(RestorePurchasesResponse { purchases })
     }
